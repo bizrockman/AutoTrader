@@ -15,62 +15,74 @@ class Strategy:
             - await get_ohlcv(symbol, timeframe, limit) -> list[list]
             - await place_order(symbol, side, quantity) -> dict
             - await get_balance() -> dict
-              Returns: {"quote_balance": float, "total_value": float, "pnl": float,
-                        "USDT": {"free": float, "used": float, "total": float}}
+              Returns: {{"quote_balance": float, "total_value": float, "pnl": float,
+                        "USDT": {{"free": float, "used": float, "total": float}}}}
               Use balance["USDT"]["free"] for available capital.
             - await get_position(symbol) -> dict
-              Returns: {"symbol": str, "quantity": float, "avg_entry_price": float,
-                        "current_price": float, "unrealized_pnl": float}
+              Returns: {{"symbol": str, "quantity": float, "avg_entry_price": float,
+                        "current_price": float, "unrealized_pnl": float}}
 
             # Market depth
             - await get_orderbook(symbol, limit=20) -> dict
-              Returns: {"bids": [[price, qty], ...], "asks": [...], "spread": float}
+              Returns: {{"bids": [[price, qty], ...], "asks": [...], "spread": float}}
 
             # Derivatives data (returns empty/None for spot)
             - await get_funding_rate(symbol) -> dict
-              Returns: {"funding_rate": float, "mark_price": float, "next_funding_time": str}
+              Returns: {{"funding_rate": float, "mark_price": float, "next_funding_time": str}}
             - await get_open_interest(symbol) -> dict
-              Returns: {"open_interest": float, "open_interest_value": float}
+              Returns: {{"open_interest": float, "open_interest_value": float}}
             - await get_long_short_ratio(symbol, timeframe="1h") -> list[dict]
-              Returns: [{"long_account": float, "short_account": float, "long_short_ratio": float}]
+              Returns: [{{"long_account": float, "short_account": float, "long_short_ratio": float}}]
 
             # Trade flow
             - await get_recent_trades(symbol, limit=100) -> list[dict]
-              Returns: [{"price": float, "amount": float, "side": str, "timestamp": int}]
+              Returns: [{{"price": float, "amount": float, "side": str, "timestamp": int}}]
 
     The exchange object operates on real market data with paper trading.
-    Orders are executed at the current market price with a 0.1% fee.
+    Orders are executed at the current market price with a {fee_pct}% fee.
+
+    ## Timeframe
+    You choose your primary_timeframe in the JSON metadata (not in code).
+    The engine calls on_candle() at your chosen interval automatically.
+    Do NOT hardcode timeframes in get_ohlcv() calls — use self.timeframe instead.
+    Think in bars, not minutes: lookbacks, cooldowns, warmup — all in bar counts.
     """
 
-    def __init__(self, exchange):
+    def __init__(self, exchange, timeframe: str = "5m"):
         self.exchange = exchange
+        self.timeframe = timeframe
         # Initialize your indicators, state, etc. here
 
     async def on_tick(self, symbol: str, price: float, timestamp: float) -> dict | None:
-        """Called every ~5 seconds with the current price.
+        """Called every ~{tick_interval}s with the current price.
 
+        Use for: real-time stop-loss/take-profit, microstructure signals.
         Return None for no action, or a dict:
-            {"action": "buy" | "sell", "symbol": str, "quantity": float, "reason": str}
+            {{"action": "buy" | "sell", "symbol": str, "quantity": float, "reason": str}}
         """
         return None
 
     async def on_candle(self, symbol: str, candle: dict, timestamp: float) -> dict | None:
-        """Called when a new candle closes.
+        """Called when a candle of your primary_timeframe closes.
 
         candle keys: open, high, low, close, volume, timestamp
+        The timeframe is set by your metadata, NOT in code.
 
         Return None for no action, or a dict:
-            {"action": "buy" | "sell", "symbol": str, "quantity": float, "reason": str}
+            {{"action": "buy" | "sell", "symbol": str, "quantity": float, "reason": str}}
         """
         return None
 
     def get_state(self) -> dict:
         """Return internal state for logging and analysis."""
-        return {}
+        return {{}}
 '''
 
 
-STRATEGY_INTERFACE_DOC = """
+def build_interface_doc(fee_pct: float = 0.1, tick_interval_sec: int = 5) -> str:
+    """Build the strategy interface doc with runtime config values."""
+    template = STRATEGY_TEMPLATE.format(fee_pct=fee_pct, tick_interval=tick_interval_sec)
+    return """
 ## Strategy Interface
 
 Your strategy must be a single Python file containing a `Strategy` class with this exact interface:
@@ -81,7 +93,7 @@ Your strategy must be a single Python file containing a `Strategy` class with th
 
 ### Rules:
 1. The class MUST be named `Strategy`
-2. `__init__` receives an `exchange` object — store it as `self.exchange`
+2. `__init__` receives `exchange` and `timeframe` — store both
 3. `on_tick` and `on_candle` are async — use `await` for exchange calls
 4. Return `None` for no action, or a trade dict with action, symbol, quantity, reason
 5. `get_state` returns a dict with any internal state you want logged
@@ -89,9 +101,12 @@ Your strategy must be a single Python file containing a `Strategy` class with th
 7. You may use any Python standard library module
 8. You may use numpy, pandas, ta if needed (available in the container)
 9. Keep your strategy in a SINGLE file — all logic in one class
+10. Do NOT hardcode timeframes — use `self.timeframe` in get_ohlcv() calls
+11. Think in bar counts, not minutes: lookbacks, cooldowns, etc.
+12. Stop-loss and take-profit logic belongs in your code (on_tick), not in metadata
 
 ### Available Market Data:
-- **get_price / get_ohlcv**: Basic price and candle data (any timeframe)
+- **get_price / get_ohlcv**: Basic price and candle data. Use `self.timeframe` as interval.
 - **get_orderbook**: Bid/ask depth — see where liquidity sits, detect walls
 - **get_funding_rate**: Futures funding rate — sentiment indicator
 - **get_open_interest**: Total positioned — crowding indicator
@@ -99,4 +114,8 @@ Your strategy must be a single Python file containing a `Strategy` class with th
 - **get_long_short_ratio**: Account ratio — retail vs smart money positioning
 
 Use what you need. Not every strategy needs all data sources.
-""".format(template=STRATEGY_TEMPLATE)
+""".format(template=template)
+
+
+# Backwards-compatible default for imports that expect the old constant
+STRATEGY_INTERFACE_DOC = build_interface_doc()

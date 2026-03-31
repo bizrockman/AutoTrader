@@ -22,3 +22,5 @@ strategy/generated/*.py
 # IDE
 .vscode/
 .idea/
+
+*.log

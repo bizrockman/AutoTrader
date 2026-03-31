@@ -24,25 +24,25 @@ class Exchange(Protocol):
 class BinanceConnector:
     """Fetches real market data from Binance."""
 
-    def __init__(self, api_key: str = "", secret: str = ""):
+    def __init__(self, api_key: str = "", secret: str = "", timeout_sec: int = 15):
         self._exchange = ccxt.binance({
             "apiKey": api_key,
             "secret": secret,
             "enableRateLimit": True,
         })
+        self._timeout = timeout_sec
 
     async def get_price(self, symbol: str) -> float:
-        ticker = await asyncio.wait_for(self._exchange.fetch_ticker(symbol), timeout=10)
+        ticker = await asyncio.wait_for(self._exchange.fetch_ticker(symbol), timeout=self._timeout)
         return float(ticker["last"])
 
     async def get_ohlcv(self, symbol: str, timeframe: str = "1m", limit: int = 100) -> list[list]:
         return await asyncio.wait_for(
-            self._exchange.fetch_ohlcv(symbol, timeframe, limit=limit), timeout=15
+            self._exchange.fetch_ohlcv(symbol, timeframe, limit=limit), timeout=self._timeout
         )
 
     async def get_orderbook(self, symbol: str, limit: int = 20) -> dict:
-        """Bid/ask depth. Shows where liquidity sits."""
-        ob = await asyncio.wait_for(self._exchange.fetch_order_book(symbol, limit=limit), timeout=10)
+        ob = await asyncio.wait_for(self._exchange.fetch_order_book(symbol, limit=limit), timeout=self._timeout)
         return {
             "bids": ob.get("bids", []),  # [[price, qty], ...]
             "asks": ob.get("asks", []),
@@ -53,7 +53,7 @@ class BinanceConnector:
     async def get_funding_rate(self, symbol: str) -> dict:
         """Current funding rate — sentiment indicator for futures."""
         try:
-            fr = await asyncio.wait_for(self._exchange.fetch_funding_rate(symbol), timeout=10)
+            fr = await asyncio.wait_for(self._exchange.fetch_funding_rate(symbol), timeout=self._timeout)
             return {
                 "funding_rate": fr.get("fundingRate"),
                 "mark_price": fr.get("markPrice"),
@@ -66,7 +66,7 @@ class BinanceConnector:
     async def get_open_interest(self, symbol: str) -> dict:
         """Total open interest — how much is positioned."""
         try:
-            oi = await asyncio.wait_for(self._exchange.fetch_open_interest(symbol), timeout=10)
+            oi = await asyncio.wait_for(self._exchange.fetch_open_interest(symbol), timeout=self._timeout)
             return {
                 "open_interest": oi.get("openInterestAmount"),
                 "open_interest_value": oi.get("openInterestValue"),
@@ -77,7 +77,7 @@ class BinanceConnector:
 
     async def get_recent_trades(self, symbol: str, limit: int = 100) -> list[dict]:
         """Recent trades — volume microstructure."""
-        trades = await asyncio.wait_for(self._exchange.fetch_trades(symbol, limit=limit), timeout=10)
+        trades = await asyncio.wait_for(self._exchange.fetch_trades(symbol, limit=limit), timeout=self._timeout)
         return [
             {
                 "price": t["price"],
@@ -88,11 +88,11 @@ class BinanceConnector:
             for t in trades
         ]
 
-    async def get_long_short_ratio(self, symbol: str, timeframe: str = "1h") -> list[dict]:
+    async def get_long_short_ratio(self, symbol: str, timeframe: str = "1h", limit: int = 10) -> list[dict]:
         """Long/short account ratio — retail vs smart money."""
         try:
             data = await asyncio.wait_for(
-                self._exchange.fetch_long_short_ratio_history(symbol, timeframe, limit=10), timeout=10
+                self._exchange.fetch_long_short_ratio_history(symbol, timeframe, limit=limit), timeout=self._timeout
             )
             return [
                 {

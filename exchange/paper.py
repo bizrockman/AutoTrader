@@ -40,12 +40,13 @@ class PaperExchange:
         connector: BinanceConnector,
         initial_balance: float = 10_000.0,
         fee_pct: float = 0.1,
+        quote_currency: str = "USDT",
     ):
         self._connector = connector
         self._fee_pct = fee_pct / 100  # 0.1% → 0.001
+        self._quote_currency = quote_currency
 
-        # Portfolio state
-        self._quote_balance: float = initial_balance  # USDT
+        self._quote_balance: float = initial_balance
         self._positions: dict[str, Position] = {}
         self._trades: list[Trade] = []
         self._initial_balance = initial_balance
@@ -131,9 +132,7 @@ class PaperExchange:
             "initial_balance": self._initial_balance,
             "pnl": total_value - self._initial_balance,
             "pnl_pct": ((total_value / self._initial_balance) - 1) * 100 if self._initial_balance > 0 else 0,
-            # ccxt-compatible keys so LLM-generated strategies can use
-            # balance['USDT']['free'] or balance.get('USDT', 0)
-            "USDT": {"free": self._quote_balance, "used": positions_value, "total": total_value},
+            self._quote_currency: {"free": self._quote_balance, "used": positions_value, "total": total_value},
         }
 
     async def get_position(self, symbol: str) -> dict:

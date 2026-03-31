@@ -19,6 +19,10 @@ CREATE TABLE IF NOT EXISTS strategies (
     wave_id         INTEGER,
     mutation_type   TEXT CHECK(mutation_type IN ('novel', 'mutation', 'crossover', 'survivor')),
     embedding       TEXT,
+    primary_timeframe TEXT DEFAULT '5m',
+    eval_bars       INTEGER DEFAULT 300,
+    warmup_bars     INTEGER DEFAULT 0,
+    candle_interval_seconds INTEGER,
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -171,7 +175,23 @@ class KnowledgeStore:
         self._db = await aiosqlite.connect(self.db_path)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(SCHEMA)
+        await self._migrate()
         await self._db.commit()
+
+    async def _migrate(self) -> None:
+        """Add columns to existing tables that predate schema changes."""
+        migrations = [
+            ("strategies", "primary_timeframe", "TEXT DEFAULT '5m'"),
+            ("strategies", "eval_bars", "INTEGER DEFAULT 300"),
+            ("strategies", "warmup_bars", "INTEGER DEFAULT 0"),
+            ("strategies", "candle_interval_seconds", "INTEGER"),
+        ]
+        for table, col, col_type in migrations:
+            try:
+                await self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+                log.info(f"Migrated: {table}.{col}")
+            except Exception:
+                pass  # column already exists
 
     async def close(self) -> None:
         if self._db:
@@ -191,11 +211,17 @@ class KnowledgeStore:
         description: str,
         model_used: str,
         wave_id: int | None = None,
+        primary_timeframe: str = "5m",
+        eval_bars: int = 300,
+        warmup_bars: int = 0,
+        candle_interval_seconds: int | None = None,
     ) -> None:
         await self.db.execute(
-            """INSERT INTO strategies (id, code, description, model_used, wave_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (strategy_id, code, description, model_used, wave_id, _now()),
+            """INSERT INTO strategies
+               (id, code, description, model_used, wave_id, primary_timeframe, eval_bars, warmup_bars, candle_interval_seconds, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (strategy_id, code, description, model_used, wave_id,
+             primary_timeframe, eval_bars, warmup_bars, candle_interval_seconds, _now()),
         )
         await self.db.commit()
 

@@ -31,23 +31,56 @@ class StrategyMetrics:
         }
 
 
+@dataclass
+class FitnessWeights:
+    """Tunable weights for the composite fitness score."""
+    pnl: float = 0.40
+    sharpe: float = 0.25
+    winrate: float = 0.15
+    drawdown: float = 0.10
+    activity: float = 0.05
+    crash: float = 0.05
+
+
+@dataclass
+class ConfidenceParams:
+    """Tunable parameters for the confidence curve."""
+    trade_halflife: float = 15.0
+    duration_halflife: float = 12.0
+
+
 def evaluate(
     trades: list[dict],
     initial_balance: float,
     final_balance: float,
     crash_count: int = 0,
     eval_period_hours: float = 1.0,
+    warmup_bars: int = 0,
+    candle_seconds: int = 300,
+    fitness_weights: FitnessWeights | None = None,
+    confidence_params: ConfidenceParams | None = None,
 ) -> StrategyMetrics:
-    """Compute fitness metrics for a strategy run."""
+    """Compute fitness metrics for a strategy run.
+
+    Trades that occurred during the warmup phase are excluded from evaluation.
+    """
+    fw = fitness_weights or FitnessWeights()
+    cp = confidence_params or ConfidenceParams()
+
+    warmup_cutoff = warmup_bars * candle_seconds if warmup_bars > 0 else 0
+
+    if warmup_cutoff > 0 and trades:
+        first_ts = _trade_timestamp(trades[0])
+        trades = [t for t in trades if _trade_timestamp(t) - first_ts >= warmup_cutoff]
+
     pnl = final_balance - initial_balance
     pnl_pct = (pnl / initial_balance * 100) if initial_balance > 0 else 0.0
 
-    # Trade analysis
     trade_count = len(trades)
-    confidence = _compute_confidence(trade_count, eval_period_hours)
+    confidence = _compute_confidence(trade_count, eval_period_hours, cp)
 
     if trade_count == 0:
-        raw_fitness = _compute_fitness(pnl_pct, 0.0, 0.0, 0, 0.0, crash_count)
+        raw_fitness = _compute_fitness(pnl_pct, 0.0, 0.0, 0, 0.0, crash_count, fw)
         return StrategyMetrics(
             pnl=pnl,
             pnl_pct=pnl_pct,
@@ -60,20 +93,14 @@ def evaluate(
             confidence=confidence,
         )
 
-    # Compute per-trade PnL (pair buys with sells)
     trade_pnls = _compute_trade_pnls(trades)
     wins = sum(1 for p in trade_pnls if p > 0)
     win_rate = (wins / len(trade_pnls) * 100) if trade_pnls else 0.0
 
-    # Sharpe-like ratio (annualized from the evaluation period)
     sharpe = _compute_sharpe(trade_pnls, eval_period_hours)
-
-    # Max drawdown from equity curve
     max_drawdown = _compute_max_drawdown(trades, initial_balance)
 
-    raw_fitness = _compute_fitness(pnl_pct, sharpe, max_drawdown, trade_count, win_rate, crash_count)
-
-    # Confidence-weighted fitness: uncertain results get pulled toward 0
+    raw_fitness = _compute_fitness(pnl_pct, sharpe, max_drawdown, trade_count, win_rate, crash_count, fw)
     fitness = raw_fitness * confidence
 
     return StrategyMetrics(
@@ -145,24 +172,25 @@ def _compute_max_drawdown(trades: list[dict], initial_balance: float) -> float:
     return max_dd
 
 
-def _compute_confidence(trade_count: int, eval_period_hours: float) -> float:
-    """How much to trust this result. 0.0 = noise, 1.0 = statistically meaningful.
-
-    Three factors:
-    1. Trade count: need ~20+ trades for any statistical significance
-    2. Eval duration: longer = seen more market conditions
-    3. Combined with diminishing returns (sigmoid-like)
-    """
-    # Trade count factor: 0 trades = 0, 20 trades = ~0.7, 50+ = ~0.95
-    trade_factor = 1 - math.exp(-trade_count / 15) if trade_count > 0 else 0
-
-    # Duration factor: 1h = 0.3, 6h = 0.7, 24h = 0.9, 72h+ = ~1.0
-    duration_factor = 1 - math.exp(-eval_period_hours / 12)
-
-    # Combine: both matter, but trade count matters more
+def _compute_confidence(trade_count: int, eval_period_hours: float, params: ConfidenceParams | None = None) -> float:
+    """How much to trust this result. 0.0 = noise, 1.0 = statistically meaningful."""
+    p = params or ConfidenceParams()
+    trade_factor = 1 - math.exp(-trade_count / p.trade_halflife) if trade_count > 0 else 0
+    duration_factor = 1 - math.exp(-eval_period_hours / p.duration_halflife)
     confidence = 0.6 * trade_factor + 0.4 * duration_factor
-
     return round(min(confidence, 1.0), 3)
+
+
+def _trade_timestamp(trade: dict) -> float:
+    """Extract a numeric timestamp from a trade dict (epoch seconds)."""
+    ts = trade.get("timestamp", 0)
+    if isinstance(ts, str):
+        from datetime import datetime, timezone
+        try:
+            return datetime.fromisoformat(ts).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            return 0.0
+    return float(ts)
 
 
 def _compute_fitness(
@@ -172,24 +200,16 @@ def _compute_fitness(
     trade_count: int,
     win_rate: float,
     crash_count: int,
+    weights: FitnessWeights | None = None,
 ) -> float:
-    """Composite fitness score. Higher is better.
+    """Composite fitness score. Higher is better."""
+    w = weights or FitnessWeights()
 
-    Weighted combination:
-    - PnL% (40%): primary objective
-    - Sharpe (25%): risk-adjusted return
-    - Win Rate (15%): consistency
-    - Drawdown penalty (10%): capital preservation
-    - Activity bonus/penalty (5%): reward some trading, penalize inactivity
-    - Crash penalty (5%): stability
-    """
-    # Normalize components to roughly [-1, 1] range
-    pnl_score = max(min(pnl_pct / 5.0, 2.0), -2.0)  # ±5% maps to ±1
-    sharpe_score = max(min(sharpe / 2.0, 2.0), -2.0)  # ±2 maps to ±1
-    wr_score = (win_rate - 50) / 50  # 50% → 0, 100% → 1, 0% → -1
-    dd_penalty = -min(max_drawdown / 10.0, 2.0)  # -10% DD → -1
+    pnl_score = max(min(pnl_pct / 5.0, 2.0), -2.0)
+    sharpe_score = max(min(sharpe / 2.0, 2.0), -2.0)
+    wr_score = (win_rate - 50) / 50
+    dd_penalty = -min(max_drawdown / 10.0, 2.0)
 
-    # Activity: reward 5-50 trades, penalize 0 or excessive
     if trade_count == 0:
         activity_score = -1.0
     elif trade_count <= 50:
@@ -200,12 +220,12 @@ def _compute_fitness(
     crash_penalty = -crash_count * 0.5
 
     fitness = (
-        0.40 * pnl_score
-        + 0.25 * sharpe_score
-        + 0.15 * wr_score
-        + 0.10 * dd_penalty
-        + 0.05 * activity_score
-        + 0.05 * crash_penalty
+        w.pnl * pnl_score
+        + w.sharpe * sharpe_score
+        + w.winrate * wr_score
+        + w.drawdown * dd_penalty
+        + w.activity * activity_score
+        + w.crash * crash_penalty
     )
 
     return round(fitness, 4)

@@ -18,8 +18,13 @@ from dataclasses import dataclass, field
 from config import Config
 from exchange.connector import BinanceConnector
 from exchange.paper import PaperExchange
-from evolution.evaluator import evaluate
-from evolution.generator import GeneratedStrategy, StrategyGenerator
+from evolution.evaluator import ConfidenceParams, FitnessWeights, evaluate
+from evolution.generator import (
+    BINANCE_TIMEFRAMES,
+    GeneratedStrategy,
+    StrategyGenerator,
+    timeframe_to_seconds,
+)
 from evolution.loop_detector import LoopDetector
 from evolution.meta import MetaTracker
 from knowledge.store import KnowledgeStore
@@ -29,14 +34,59 @@ log = logging.getLogger(__name__)
 
 
 @dataclass
+class CandleAccumulator:
+    """Builds a candle from ticks for one timeframe interval."""
+    interval_sec: int
+    current_start: float = 0.0
+    open: float = 0.0
+    high: float = 0.0
+    low: float = 0.0
+    close: float = 0.0
+    volume: float = 0.0
+    tick_count: int = 0
+
+    def update(self, price: float, ts: float) -> dict | None:
+        """Feed a tick. Returns completed candle dict if interval boundary crossed, else None."""
+        if self.tick_count == 0:
+            self.current_start = (ts // self.interval_sec) * self.interval_sec
+            self.open = self.high = self.low = self.close = price
+            self.tick_count = 1
+            return None
+
+        candle_end = self.current_start + self.interval_sec
+        if ts >= candle_end:
+            completed = {
+                "timestamp": int(self.current_start * 1000),
+                "open": self.open, "high": self.high,
+                "low": self.low, "close": self.close,
+                "volume": self.volume,
+            }
+            self.current_start = (ts // self.interval_sec) * self.interval_sec
+            self.open = self.high = self.low = self.close = price
+            self.volume = 0.0
+            self.tick_count = 1
+            return completed
+
+        self.high = max(self.high, price)
+        self.low = min(self.low, price)
+        self.close = price
+        self.tick_count += 1
+        return None
+
+
+@dataclass
 class ActiveStrategy:
     """A strategy currently running in the pool."""
     strategy_id: str
     run_id: int
     started_at: float
     eval_period_sec: int
-    exchange: PaperExchange  # Each strategy gets its own paper exchange
+    exchange: PaperExchange
+    primary_timeframe: str = "5m"
+    candle_seconds: int = 300
+    warmup_bars: int = 0
     crash_count: int = 0
+    accumulator: CandleAccumulator | None = None
 
 
 class Orchestrator:
@@ -46,23 +96,51 @@ class Orchestrator:
         self.generator = StrategyGenerator(
             default_model=config.default_model,
             model_pool=config.model_pool,
+            temperature_generation=config.llm_temperature_generation,
+            temperature_analysis=config.llm_temperature_analysis,
+            max_tokens_generation=config.llm_max_tokens_generation,
+            max_tokens_analysis=config.llm_max_tokens_analysis,
+            default_model_ratio=config.llm_default_model_ratio,
+            history_max_turns=config.llm_history_max_turns,
+            fee_pct=config.trading_fee_pct,
+            tick_interval_sec=config.tick_interval_sec,
         )
-        self.runner = StrategyRunner()
+        self.runner = StrategyRunner(
+            docker_memory=config.docker_memory,
+            docker_cpus=config.docker_cpus,
+            ready_timeout_sec=config.docker_ready_timeout_sec,
+            tick_timeout_sec=config.strategy_tick_timeout_sec,
+        )
         self.loop_detector = LoopDetector()
         self.meta = MetaTracker()
-        self.connector = BinanceConnector(config.binance_api_key, config.binance_secret)
+        self.connector = BinanceConnector(
+            config.binance_api_key, config.binance_secret, timeout_sec=config.api_timeout_sec,
+        )
+
+        self._fitness_weights = FitnessWeights(
+            pnl=config.fitness_weight_pnl,
+            sharpe=config.fitness_weight_sharpe,
+            winrate=config.fitness_weight_winrate,
+            drawdown=config.fitness_weight_drawdown,
+            activity=config.fitness_weight_activity,
+            crash=config.fitness_weight_crash,
+        )
+        self._confidence_params = ConfidenceParams(
+            trade_halflife=config.confidence_trade_halflife,
+            duration_halflife=config.confidence_duration_halflife,
+        )
 
         self._active: dict[str, ActiveStrategy] = {}
         self._pending_results: list[dict] = []
         self._running = False
         self._current_wave_id: int | None = None
 
-        # Price cache — fetch once per tick, share across all strategies
         self._last_price: float = 0.0
         self._last_price_time: float = 0.0
 
-        # Candle tracking — detect when a new 1m candle closes
-        self._last_candle_minute: int = -1
+        # Per-timeframe candle cache: avoid fetching the same Binance candle N times
+        self._candle_cache: dict[str, tuple[float, dict]] = {}  # tf -> (fetched_ts, candle)
+        self._last_candle_boundary: dict[str, int] = {}  # tf -> last boundary epoch
 
     async def start(self) -> None:
         """Start the orchestrator."""
@@ -90,7 +168,7 @@ class Orchestrator:
             # Main loop
             while self._running:
                 await self._tick_loop()
-                await asyncio.sleep(5)  # Check every 5 seconds
+                await asyncio.sleep(self.config.tick_interval_sec)
 
         except KeyboardInterrupt:
             log.info("Shutting down...")
@@ -126,19 +204,25 @@ class Orchestrator:
 
             strategy_id = strat["strategy_id"]
             code = strat["code"]
+            tf = strat.get("primary_timeframe", "5m")
+            eval_bars = strat.get("eval_bars", 300)
+            warmup = strat.get("warmup_bars", 0)
+            custom_sec = strat.get("candle_interval_seconds")
+            candle_sec = timeframe_to_seconds(tf, custom_sec)
+            eval_period_sec = eval_bars * candle_sec
 
             paper_exchange = PaperExchange(
                 connector=self.connector,
                 initial_balance=self.config.initial_balance,
                 fee_pct=self.config.trading_fee_pct,
+                quote_currency=self.config.quote_currency,
             )
 
-            eval_period_sec = self.config.eval_period_minutes * 60
             start_snapshot = await self._capture_market_snapshot(self.config.default_symbol)
             run_id = await self.store.start_run(strategy_id, eval_period_sec, start_snapshot=start_snapshot)
 
             try:
-                await self.runner.start_strategy(strategy_id, code, paper_exchange)
+                await self.runner.start_strategy(strategy_id, code, paper_exchange, timeframe=tf)
             except Exception as e:
                 log.error(f"Failed to resume strategy {strategy_id}: {e}")
                 await self.store.finish_run(run_id, status="crashed", error_message=str(e))
@@ -150,10 +234,14 @@ class Orchestrator:
                 started_at=time.time(),
                 eval_period_sec=eval_period_sec,
                 exchange=paper_exchange,
+                primary_timeframe=tf,
+                candle_seconds=candle_sec,
+                warmup_bars=warmup,
             )
 
+            eval_min = round(eval_period_sec / 60)
             desc = strat.get("description", "")[:80]
-            log.info(f"Resumed {strategy_id} — eval: {self.config.eval_period_minutes}min — {desc}")
+            log.info(f"Resumed {strategy_id} — tf: {tf}, eval: {eval_bars} bars (~{eval_min}min) — {desc}")
             deployed += 1
 
         return deployed
@@ -162,8 +250,8 @@ class Orchestrator:
         """Capture current market state for context."""
         try:
             price = await self.connector.get_price(symbol)
-            ohlcv_1h = await self.connector.get_ohlcv(symbol, "1h", limit=24)
-            ohlcv_1d = await self.connector.get_ohlcv(symbol, "1d", limit=7)
+            ohlcv_1h = await self.connector.get_ohlcv(symbol, "1h", limit=self.config.snapshot_hourly_limit)
+            ohlcv_1d = await self.connector.get_ohlcv(symbol, "1d", limit=self.config.snapshot_daily_limit)
 
             # Calculate changes from OHLCV
             change_1h = ((price - ohlcv_1h[-2][4]) / ohlcv_1h[-2][4] * 100) if len(ohlcv_1h) >= 2 else 0
@@ -182,7 +270,12 @@ class Orchestrator:
                 vol_24h = 0
 
             # Regime classification
-            regime = self._classify_regime(ohlcv_1d, price)
+            regime = self._classify_regime(
+                ohlcv_1d, price,
+                self.config.regime_volatility_pct,
+                self.config.regime_trend_pct,
+                self.config.regime_slope_pct,
+            )
 
             return {
                 "price": price,
@@ -198,15 +291,20 @@ class Orchestrator:
             return {"price": self._last_price, "regime": "unknown", "timestamp": time.time()}
 
     @staticmethod
-    def _classify_regime(ohlcv_daily: list[list], current_price: float) -> str:
-        """Simple regime classification. No ML needed."""
+    def _classify_regime(
+        ohlcv_daily: list[list],
+        current_price: float,
+        vol_threshold: float = 5.0,
+        trend_threshold: float = 2.0,
+        slope_threshold: float = 0.5,
+    ) -> str:
+        """Simple regime classification."""
         if len(ohlcv_daily) < 3:
             return "unknown"
 
         closes = [c[4] for c in ohlcv_daily]
         sma = sum(closes) / len(closes)
 
-        # ATR (average true range) as volatility measure
         trs = []
         for i in range(1, len(ohlcv_daily)):
             high, low, prev_close = ohlcv_daily[i][2], ohlcv_daily[i][3], ohlcv_daily[i - 1][4]
@@ -215,18 +313,17 @@ class Orchestrator:
         atr = sum(trs) / len(trs) if trs else 0
         atr_pct = (atr / current_price * 100) if current_price > 0 else 0
 
-        # Trend: is price consistently above/below SMA?
         above_sma = current_price > sma
         sma_slope = (closes[-1] - closes[0]) / len(closes) if len(closes) > 1 else 0
         sma_slope_pct = (sma_slope / sma * 100) if sma > 0 else 0
 
-        if atr_pct > 5:  # High volatility
-            if abs(sma_slope_pct) > 2:
+        if atr_pct > vol_threshold:
+            if abs(sma_slope_pct) > trend_threshold:
                 return "trending_up" if sma_slope_pct > 0 else "trending_down"
             return "volatile"
-        elif above_sma and sma_slope_pct > 0.5:
+        elif above_sma and sma_slope_pct > slope_threshold:
             return "trending_up"
-        elif not above_sma and sma_slope_pct < -0.5:
+        elif not above_sma and sma_slope_pct < -slope_threshold:
             return "trending_down"
         else:
             return "range"
@@ -235,7 +332,7 @@ class Orchestrator:
         """One iteration of the main loop: feed ticks, check harvests, maybe evolve."""
         symbol = self.config.default_symbol
 
-        # 1. Fetch price ONCE, share across all strategies (with retry)
+        # 1. Fetch price ONCE
         price = None
         for attempt in range(3):
             try:
@@ -255,24 +352,7 @@ class Orchestrator:
 
         timestamp = time.time()
 
-        # 2. Check if a new 1m candle just closed
-        current_minute = int(timestamp // 60)
-        new_candle = current_minute > self._last_candle_minute and self._last_candle_minute >= 0
-        candle_data = None
-        if new_candle:
-            try:
-                ohlcv = await self.connector.get_ohlcv(symbol, "1m", limit=2)
-                if len(ohlcv) >= 2:
-                    c = ohlcv[-2]  # The just-closed candle (not the current one)
-                    candle_data = {
-                        "timestamp": c[0], "open": c[1], "high": c[2],
-                        "low": c[3], "close": c[4], "volume": c[5],
-                    }
-            except Exception as e:
-                log.warning(f"Failed to fetch candle: {e}")
-        self._last_candle_minute = current_minute
-
-        # 3. Send tick (and candle if available) to all active strategies
+        # 2. Per-strategy: send tick + timeframe-aware candle dispatch
         for strat_id, active in list(self._active.items()):
             try:
                 # Always send tick
@@ -282,9 +362,13 @@ class Orchestrator:
                 elif result and result.get("type") == "error":
                     active.crash_count += 1
 
-                # Send candle if one just closed
-                if candle_data:
-                    result = await self.runner.send_candle(strat_id, symbol, candle_data, timestamp, active.exchange)
+                # Skip candle dispatch for tick-only strategies
+                if active.primary_timeframe == "tick":
+                    continue
+
+                candle = await self._get_candle_for(active, symbol, price, timestamp)
+                if candle:
+                    result = await self.runner.send_candle(strat_id, symbol, candle, timestamp, active.exchange)
                     if result and result.get("type") == "signal" and result.get("result"):
                         await self._handle_signal(active, result["result"])
                     elif result and result.get("type") == "error":
@@ -309,6 +393,43 @@ class Orchestrator:
             await self._run_evolution_wave(
                 f"harvested_{len(self._pending_results)}_strategies"
             )
+
+    async def _get_candle_for(self, active: ActiveStrategy, symbol: str, price: float, ts: float) -> dict | None:
+        """Get a just-closed candle for this strategy's timeframe, or None."""
+        tf = active.primary_timeframe
+        sec = active.candle_seconds
+
+        # Standard Binance timeframes: fetch from API (better volume/OHLC data)
+        if tf in BINANCE_TIMEFRAMES:
+            boundary = int(ts // sec)
+            last = self._last_candle_boundary.get(tf, -1)
+            if boundary <= last:
+                return None
+            self._last_candle_boundary[tf] = boundary
+
+            # Check cache to avoid duplicate API calls for same timeframe
+            cached = self._candle_cache.get(tf)
+            if cached and cached[0] == boundary:
+                return cached[1]
+
+            try:
+                ohlcv = await self.connector.get_ohlcv(symbol, tf, limit=2)
+                if len(ohlcv) >= 2:
+                    c = ohlcv[-2]
+                    candle = {
+                        "timestamp": c[0], "open": c[1], "high": c[2],
+                        "low": c[3], "close": c[4], "volume": c[5],
+                    }
+                    self._candle_cache[tf] = (boundary, candle)
+                    return candle
+            except Exception as e:
+                log.warning(f"Failed to fetch {tf} candle: {e}")
+            return None
+
+        # Custom timeframes: build from tick accumulator
+        if active.accumulator is None:
+            active.accumulator = CandleAccumulator(interval_sec=sec)
+        return active.accumulator.update(price, ts)
 
     async def _handle_signal(self, active: ActiveStrategy, signal: dict) -> None:
         """Process a trade signal from a strategy."""
@@ -348,7 +469,6 @@ class Orchestrator:
         trades = active.exchange.get_trade_history()
         balance = await active.exchange.get_balance()
 
-        # Compute metrics
         eval_hours = active.eval_period_sec / 3600
         metrics = evaluate(
             trades=trades,
@@ -356,6 +476,10 @@ class Orchestrator:
             final_balance=balance["total_value"],
             crash_count=active.crash_count,
             eval_period_hours=eval_hours,
+            warmup_bars=active.warmup_bars,
+            candle_seconds=active.candle_seconds,
+            fitness_weights=self._fitness_weights,
+            confidence_params=self._confidence_params,
         )
 
         # Capture end-of-run market snapshot
@@ -402,8 +526,9 @@ class Orchestrator:
             f"Fitness={metrics.fitness_score:.4f}, Trades={metrics.trade_count}"
         )
 
-        # Auto-promote to Hall of Fame if strategy performed well AND we're confident
-        if metrics.pnl_pct > 0 and metrics.confidence >= 0.5 and metrics.fitness_score > 0.15:
+        if (metrics.pnl_pct > self.config.hof_min_pnl_pct
+                and metrics.confidence >= self.config.hof_min_confidence
+                and metrics.fitness_score > self.config.hof_min_fitness):
             await self.store.promote_to_hall_of_fame(
                 strategy_id=strategy_id,
                 summary=description,
@@ -481,7 +606,7 @@ class Orchestrator:
                  f"best={health.best_fitness_ever:.3f}, stagnating={health.is_stagnating}")
 
         # Auto cold-start if stagnating hard
-        if health.waves_since_improvement >= 15:
+        if health.waves_since_improvement >= self.config.stagnation_wave_threshold:
             log.warning("Severe stagnation — triggering cold start for fresh perspective")
             self.generator.cold_start()
 
@@ -548,38 +673,38 @@ class Orchestrator:
         """Deploy a generated strategy."""
         strategy_id = f"wave{wave_id:03d}_{uuid.uuid4().hex[:8]}"
 
-        # Save to knowledge store
         await self.store.save_strategy(
             strategy_id=strategy_id,
             code=gen_strat.code,
             description=gen_strat.description,
             model_used=gen_strat.model_used,
             wave_id=wave_id,
+            primary_timeframe=gen_strat.primary_timeframe,
+            eval_bars=gen_strat.eval_bars,
+            warmup_bars=gen_strat.warmup_bars,
+            candle_interval_seconds=gen_strat.candle_interval_seconds,
         )
 
-        # Track which blocks this strategy uses
         for block_name in (gen_strat.blocks_used or []):
             await self.store.record_block_usage(strategy_id, block_name)
 
-        # Create a fresh paper exchange for this strategy
         paper_exchange = PaperExchange(
             connector=self.connector,
             initial_balance=self.config.initial_balance,
             fee_pct=self.config.trading_fee_pct,
+            quote_currency=self.config.quote_currency,
         )
 
-        # Use strategy-specific eval period (LLM decides based on timeframe)
-        eval_period_sec = gen_strat.eval_period_minutes * 60
-
-        # Capture market snapshot at deploy time
+        eval_period_sec = gen_strat.eval_period_seconds
+        candle_sec = gen_strat.candle_seconds
         start_snapshot = await self._capture_market_snapshot(self.config.default_symbol)
-
-        # Start run in DB
         run_id = await self.store.start_run(strategy_id, eval_period_sec, start_snapshot=start_snapshot)
 
-        # Start in Docker
         try:
-            await self.runner.start_strategy(strategy_id, gen_strat.code, paper_exchange)
+            await self.runner.start_strategy(
+                strategy_id, gen_strat.code, paper_exchange,
+                timeframe=gen_strat.primary_timeframe,
+            )
         except Exception as e:
             log.error(f"Failed to start strategy {strategy_id}: {e}")
             await self.store.finish_run(run_id, status="crashed", error_message=str(e))
@@ -591,11 +716,16 @@ class Orchestrator:
             started_at=time.time(),
             eval_period_sec=eval_period_sec,
             exchange=paper_exchange,
+            primary_timeframe=gen_strat.primary_timeframe,
+            candle_seconds=candle_sec,
+            warmup_bars=gen_strat.warmup_bars,
         )
 
+        eval_minutes = round(eval_period_sec / 60)
         log.info(
             f"Deployed {strategy_id} — "
-            f"eval: {gen_strat.eval_period_minutes}min — "
+            f"tf: {gen_strat.primary_timeframe}, eval: {gen_strat.eval_bars} bars (~{eval_minutes}min), "
+            f"warmup: {gen_strat.warmup_bars} bars — "
             f"model: {gen_strat.model_used} — "
             f"{gen_strat.description[:80]}"
         )

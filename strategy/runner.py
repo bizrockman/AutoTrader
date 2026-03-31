@@ -46,6 +46,7 @@ def _host_dumps(obj: object) -> str:
 CONTAINER_WORKER = r'''
 import asyncio
 import json
+import os
 import sys
 import importlib.util
 
@@ -129,7 +130,13 @@ async def main():
     spec.loader.exec_module(mod)
 
     exchange = ExchangeProxy()
-    strategy = mod.Strategy(exchange)
+    # Pass timeframe from environment (set by host) to Strategy.__init__
+    timeframe = os.environ.get("STRATEGY_TIMEFRAME", "5m")
+    try:
+        strategy = mod.Strategy(exchange, timeframe=timeframe)
+    except TypeError:
+        # Fallback for strategies that don't accept timeframe yet
+        strategy = mod.Strategy(exchange)
 
     # Signal ready
     print(_dumps({"type": "ready"}), flush=True)
@@ -179,11 +186,22 @@ class StrategyProcess:
 class StrategyRunner:
     """Manages strategy execution in Docker containers."""
 
-    def __init__(self, docker_image: str = "autotrader-strategy"):
+    def __init__(
+        self,
+        docker_image: str = "autotrader-strategy",
+        docker_memory: str = "256m",
+        docker_cpus: str = "0.5",
+        ready_timeout_sec: int = 30,
+        tick_timeout_sec: int = 10,
+    ):
         self._docker_image = docker_image
+        self._docker_memory = docker_memory
+        self._docker_cpus = docker_cpus
+        self._ready_timeout_sec = ready_timeout_sec
+        self._tick_timeout_sec = tick_timeout_sec
         self._running: dict[str, StrategyProcess] = {}
 
-    async def start_strategy(self, strategy_id: str, code: str, exchange) -> StrategyProcess:
+    async def start_strategy(self, strategy_id: str, code: str, exchange, timeframe: str = "5m") -> StrategyProcess:
         """Start a strategy in a Docker container."""
         # Write strategy code and worker to a temp directory
         temp_dir = tempfile.mkdtemp(prefix=f"strat_{strategy_id}_")
@@ -204,9 +222,10 @@ class StrategyRunner:
             "--rm",
             "--name", container_name,
             "-i",  # Keep stdin open
-            "--network", "none",  # No network access (exchange goes through proxy)
-            "--memory", "256m",
-            "--cpus", "0.5",
+            "-e", f"STRATEGY_TIMEFRAME={timeframe}",
+            "--network", "none",
+            "--memory", self._docker_memory,
+            "--cpus", self._docker_cpus,
             "-v", f"{temp_dir}:/strategy:ro",
             self._docker_image,
             "python", "/strategy/worker.py",
@@ -225,7 +244,7 @@ class StrategyRunner:
 
         # Wait for ready signal
         try:
-            ready_line = await asyncio.wait_for(proc.stdout.readline(), timeout=30)
+            ready_line = await asyncio.wait_for(proc.stdout.readline(), timeout=self._ready_timeout_sec)
             msg = json.loads(ready_line.decode().strip())
             if msg.get("type") != "ready":
                 raise RuntimeError(f"Strategy {strategy_id} did not send ready signal: {msg}")
@@ -265,7 +284,7 @@ class StrategyRunner:
         """Read strategy output, handle exchange proxy requests."""
         try:
             while True:
-                line = await asyncio.wait_for(sp.process.stdout.readline(), timeout=10)
+                line = await asyncio.wait_for(sp.process.stdout.readline(), timeout=self._tick_timeout_sec)
                 if not line:
                     return None
 

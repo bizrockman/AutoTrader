@@ -17,9 +17,31 @@ from dataclasses import dataclass, field
 import litellm
 
 from knowledge.store import EvolutionContext
-from strategy.template import STRATEGY_INTERFACE_DOC
+from strategy.template import build_interface_doc
 
 log = logging.getLogger(__name__)
+
+
+TIMEFRAME_SECONDS: dict[str, int] = {
+    "tick": 0,
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200, "4h": 14400,
+    "6h": 21600, "8h": 28800, "12h": 43200,
+    "1d": 86400, "3d": 259200, "1w": 604800,
+}
+
+BINANCE_TIMEFRAMES = set(TIMEFRAME_SECONDS.keys()) - {"tick"}
+
+VALID_TIMEFRAMES = set(TIMEFRAME_SECONDS.keys()) | {"custom"}
+
+
+def timeframe_to_seconds(tf: str, custom_seconds: int | None = None) -> int:
+    """Convert a timeframe string to seconds. Returns 5 for 'tick' (poll interval)."""
+    if tf == "tick":
+        return 5
+    if tf == "custom":
+        return custom_seconds or 60
+    return TIMEFRAME_SECONDS.get(tf, 300)
 
 
 @dataclass
@@ -27,11 +49,26 @@ class GeneratedStrategy:
     code: str
     description: str
     model_used: str
-    eval_period_minutes: int = 60
+    primary_timeframe: str = "5m"
+    eval_bars: int = 300
+    warmup_bars: int = 0
+    candle_interval_seconds: int | None = None
     blocks_used: list[str] | None = None
 
+    @property
+    def candle_seconds(self) -> int:
+        return timeframe_to_seconds(self.primary_timeframe, self.candle_interval_seconds)
 
-SYSTEM_PROMPT = """You are an autonomous trading strategy researcher.
+    @property
+    def eval_period_seconds(self) -> int:
+        return self.eval_bars * self.candle_seconds
+
+    @property
+    def warmup_seconds(self) -> int:
+        return self.warmup_bars * self.candle_seconds
+
+
+_SYSTEM_PROMPT_TEMPLATE = """You are an autonomous trading strategy researcher.
 You write Python trading strategies, deploy them on live crypto markets,
 observe the results, and iterate. Your goal: find strategies that make money.
 
@@ -43,7 +80,7 @@ You may be given a conversation history from earlier waves. Use it —
 those connections and intuitions are valuable. But don't rely on it:
 everything important is also in the briefing data (blocks, metrics, plans).
 If the conversation starts fresh, you lose nothing critical.
-""".format(interface_doc=STRATEGY_INTERFACE_DOC)
+"""
 
 
 GENERATION_PROMPT = """## Briefing: Wave {wave}
@@ -75,11 +112,30 @@ GENERATION_PROMPT = """## Briefing: Wave {wave}
 ## Task
 Write {count} new strategies.
 
+For each strategy, you MUST choose the execution parameters:
+
+- **primary_timeframe**: The candle interval your strategy operates on.
+  Valid: "tick", "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "custom"
+  Use "tick" for microstructure strategies (orderbook, trade flow).
+  Use "custom" + candle_interval_seconds for non-standard intervals (e.g. 450 = 7.5 min).
+  The engine will call on_candle() at your chosen interval. on_tick() is always called every ~5s.
+
+- **eval_bars**: How many bars (candles) to observe before evaluating. Think in bars, not minutes.
+  Example: 300 bars of 5m = 25 hours. 300 bars of 1h = 12.5 days.
+  For "tick" mode, 1 bar = 1 tick (~5 seconds). 720 bars = 1 hour.
+  More bars = higher confidence but longer evaluation. 200-500 is typical.
+
+- **warmup_bars**: How many bars your indicators need before generating valid signals.
+  Example: 20-period Bollinger Band needs warmup_bars >= 20.
+  Trades during warmup are ignored by the evaluator.
+
 ```json
 [
   {{
     "description": "What this does and why.",
-    "eval_period_minutes": 60,
+    "primary_timeframe": "5m",
+    "eval_bars": 300,
+    "warmup_bars": 30,
     "blocks_used": ["block_name"],
     "code": "class Strategy:\\n    ..."
   }}
@@ -135,17 +191,37 @@ class StrategyGenerator:
     All artifacts are saved to DB independently — a cold-start loses no data.
     """
 
-    def __init__(self, default_model: str = "claude-opus-4-6", model_pool: list[str] | None = None):
+    def __init__(
+        self,
+        default_model: str = "claude-opus-4-6",
+        model_pool: list[str] | None = None,
+        temperature_generation: float = 0.8,
+        temperature_analysis: float = 0.3,
+        max_tokens_generation: int = 8000,
+        max_tokens_analysis: int = 6000,
+        default_model_ratio: float = 0.7,
+        history_max_turns: int = 10,
+        fee_pct: float = 0.1,
+        tick_interval_sec: int = 5,
+    ):
         self.default_model = default_model
         self.model_pool = model_pool or [default_model]
+        self.temperature_generation = temperature_generation
+        self.temperature_analysis = temperature_analysis
+        self.max_tokens_generation = max_tokens_generation
+        self.max_tokens_analysis = max_tokens_analysis
+        self.default_model_ratio = default_model_ratio
+        self.history_max_turns = history_max_turns
 
-        # Conversation history — short-term memory within a session
-        # Gets cleared on cold-start, but that's fine: DB has everything
+        self._system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
+            interface_doc=build_interface_doc(fee_pct=fee_pct, tick_interval_sec=tick_interval_sec)
+        )
+
         self._generation_history: list[dict] = []
         self._analysis_history: list[dict] = []
 
     def _pick_model(self) -> str:
-        if random.random() < 0.7 or len(self.model_pool) == 1:
+        if random.random() < self.default_model_ratio or len(self.model_pool) == 1:
             return self.default_model
         return random.choice(self.model_pool)
 
@@ -180,24 +256,22 @@ class StrategyGenerator:
             count=count,
         )
 
-        # Build messages: system + history + new prompt
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages = [{"role": "system", "content": self._system_prompt}]
         messages.extend(self._generation_history)
         messages.append({"role": "user", "content": prompt})
 
         response = await litellm.acompletion(
             model=model,
             messages=messages,
-            temperature=0.8,
-            max_tokens=8000,
+            temperature=self.temperature_generation,
+            max_tokens=self.max_tokens_generation,
         )
 
         content = response.choices[0].message.content
 
-        # Save to conversation history (short-term memory)
         self._generation_history.append({"role": "user", "content": prompt})
         self._generation_history.append({"role": "assistant", "content": content})
-        self._trim_history(self._generation_history, max_turns=10)
+        self._trim_history(self._generation_history, max_turns=self.history_max_turns)
 
         strategies = self._parse_strategies(content, model)
         log.info(f"Generated {len(strategies)} strategies")
@@ -242,16 +316,15 @@ class StrategyGenerator:
         response = await litellm.acompletion(
             model=model,
             messages=messages,
-            temperature=0.3,
-            max_tokens=6000,
+            temperature=self.temperature_analysis,
+            max_tokens=self.max_tokens_analysis,
         )
 
         content = response.choices[0].message.content
 
-        # Save to analysis history
         self._analysis_history.append({"role": "user", "content": prompt})
         self._analysis_history.append({"role": "assistant", "content": content})
-        self._trim_history(self._analysis_history, max_turns=10)
+        self._trim_history(self._analysis_history, max_turns=self.history_max_turns)
 
         return self._parse_analysis(content)
 
@@ -346,11 +419,20 @@ class StrategyGenerator:
         for item in raw:
             if not isinstance(item, dict) or "code" not in item:
                 continue
+
+            tf = item.get("primary_timeframe", "5m")
+            if tf not in VALID_TIMEFRAMES:
+                log.warning(f"Invalid timeframe '{tf}', defaulting to '5m'")
+                tf = "5m"
+
             strategies.append(GeneratedStrategy(
                 code=item["code"],
                 description=item.get("description", ""),
                 model_used=model,
-                eval_period_minutes=item.get("eval_period_minutes", 60),
+                primary_timeframe=tf,
+                eval_bars=item.get("eval_bars", 300),
+                warmup_bars=item.get("warmup_bars", 0),
+                candle_interval_seconds=item.get("candle_interval_seconds"),
                 blocks_used=item.get("blocks_used"),
             ))
         return strategies
