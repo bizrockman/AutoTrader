@@ -15,7 +15,12 @@ class Strategy:
             - await get_ohlcv(symbol, timeframe, limit) -> list[list]
             - await place_order(symbol, side, quantity) -> dict
             - await get_balance() -> dict
+              Returns: {"quote_balance": float, "total_value": float, "pnl": float,
+                        "USDT": {"free": float, "used": float, "total": float}}
+              Use balance["USDT"]["free"] for available capital.
             - await get_position(symbol) -> dict
+              Returns: {"symbol": str, "quantity": float, "avg_entry_price": float,
+                        "current_price": float, "unrealized_pnl": float}
 
             # Market depth
             - await get_orderbook(symbol, limit=20) -> dict

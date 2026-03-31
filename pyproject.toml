@@ -11,3 +11,23 @@ dependencies = [
     "python-dotenv>=1.0",
     "docker>=7.0",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.uv]
+# aiodns breaks DNS resolution on Windows (uses c-ares which can't reach
+# the system DNS servers).  ccxt lists it as a dependency but aiohttp falls
+# back to its ThreadedResolver when aiodns is absent — works fine.
+override-dependencies = [
+    "aiodns ; sys_platform == 'never'",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "integration: hits the real Binance API (may be slow / need network)",
+]

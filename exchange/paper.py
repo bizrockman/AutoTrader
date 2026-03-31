@@ -131,6 +131,9 @@ class PaperExchange:
             "initial_balance": self._initial_balance,
             "pnl": total_value - self._initial_balance,
             "pnl_pct": ((total_value / self._initial_balance) - 1) * 100 if self._initial_balance > 0 else 0,
+            # ccxt-compatible keys so LLM-generated strategies can use
+            # balance['USDT']['free'] or balance.get('USDT', 0)
+            "USDT": {"free": self._quote_balance, "used": positions_value, "total": total_value},
         }
 
     async def get_position(self, symbol: str) -> dict:
