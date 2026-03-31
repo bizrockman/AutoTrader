@@ -4,13 +4,14 @@ These hit the real Binance API (public endpoints, no key needed).
 They verify structure and sanity of the returned data.
 """
 import pytest
+import pytest_asyncio
 
 from exchange.connector import BinanceConnector
 
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def connector():
     c = BinanceConnector()
     yield c
