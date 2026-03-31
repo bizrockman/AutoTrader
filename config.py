@@ -41,6 +41,7 @@ class Config:
 
     # Evolution
     max_parallel_strategies: int = field(default_factory=lambda: int(os.getenv("MAX_PARALLEL_STRATEGIES", "5")))
+    eval_period_minutes: int = field(default_factory=lambda: int(os.getenv("EVAL_PERIOD_MINUTES", "60")))
 
     # Paths
     db_path: str = field(default_factory=lambda: os.getenv("DB_PATH", "autotrader.db"))

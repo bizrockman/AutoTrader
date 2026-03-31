@@ -71,8 +71,21 @@ class Orchestrator:
         self._running = True
 
         try:
-            # Initial generation
-            await self._run_evolution_wave("initial")
+            # Clean up stale runs from previous process
+            interrupted = await self.store.interrupt_stale_runs()
+            if interrupted:
+                log.info(f"Marked {interrupted} stale run(s) as interrupted")
+
+            # Resume existing strategies before generating new ones
+            resumed = await self._resume_strategies()
+
+            # Only generate new strategies if we still have empty slots
+            free_slots = self.config.max_parallel_strategies - len(self._active)
+            if free_slots > 0:
+                log.info(f"{free_slots} slot(s) free after resume — generating new strategies")
+                await self._run_evolution_wave("initial" if resumed == 0 else "fill_slots")
+            else:
+                log.info(f"All {len(self._active)} slot(s) filled from resume — skipping generation")
 
             # Main loop
             while self._running:
@@ -92,6 +105,58 @@ class Orchestrator:
         await self.connector.close()
         await self.store.close()
         log.info("Orchestrator stopped.")
+
+    async def _resume_strategies(self) -> int:
+        """Redeploy strategies from the DB instead of generating new ones."""
+        free_slots = self.config.max_parallel_strategies - len(self._active)
+        if free_slots <= 0:
+            return 0
+
+        resumable = await self.store.get_resumable_strategies(limit=free_slots)
+        if not resumable:
+            log.info("No existing strategies to resume — will generate fresh")
+            return 0
+
+        log.info(f"Resuming {len(resumable)} strategy/ies from DB")
+        deployed = 0
+
+        for strat in resumable:
+            if len(self._active) >= self.config.max_parallel_strategies:
+                break
+
+            strategy_id = strat["strategy_id"]
+            code = strat["code"]
+
+            paper_exchange = PaperExchange(
+                connector=self.connector,
+                initial_balance=self.config.initial_balance,
+                fee_pct=self.config.trading_fee_pct,
+            )
+
+            eval_period_sec = self.config.eval_period_minutes * 60
+            start_snapshot = await self._capture_market_snapshot(self.config.default_symbol)
+            run_id = await self.store.start_run(strategy_id, eval_period_sec, start_snapshot=start_snapshot)
+
+            try:
+                await self.runner.start_strategy(strategy_id, code, paper_exchange)
+            except Exception as e:
+                log.error(f"Failed to resume strategy {strategy_id}: {e}")
+                await self.store.finish_run(run_id, status="crashed", error_message=str(e))
+                continue
+
+            self._active[strategy_id] = ActiveStrategy(
+                strategy_id=strategy_id,
+                run_id=run_id,
+                started_at=time.time(),
+                eval_period_sec=eval_period_sec,
+                exchange=paper_exchange,
+            )
+
+            desc = strat.get("description", "")[:80]
+            log.info(f"Resumed {strategy_id} — eval: {self.config.eval_period_minutes}min — {desc}")
+            deployed += 1
+
+        return deployed
 
     async def _capture_market_snapshot(self, symbol: str) -> dict:
         """Capture current market state for context."""

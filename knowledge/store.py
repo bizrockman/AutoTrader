@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS strategy_runs (
     ended_at        TEXT,
     eval_period_sec INTEGER NOT NULL,
     status          TEXT NOT NULL DEFAULT 'running'
-                    CHECK(status IN ('running', 'completed', 'crashed', 'killed')),
+                    CHECK(status IN ('running', 'completed', 'crashed', 'killed', 'interrupted')),
     error_message   TEXT,
     start_snapshot  TEXT,
     end_snapshot    TEXT
@@ -231,6 +231,59 @@ class KnowledgeStore:
             "SELECT sr.*, s.code, s.description FROM strategy_runs sr JOIN strategies s ON sr.strategy_id = s.id WHERE sr.status = 'running'"
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
+
+    async def interrupt_stale_runs(self) -> int:
+        """Mark all 'running' runs as 'killed' (previous process died)."""
+        cur = await self.db.execute(
+            "UPDATE strategy_runs SET status = 'killed', ended_at = ? WHERE status = 'running'",
+            (_now(),),
+        )
+        await self.db.commit()
+        return cur.rowcount
+
+    async def get_resumable_strategies(self, limit: int = 5) -> list[dict]:
+        """Best strategies to redeploy on restart.
+
+        Priority: Hall of Fame first, then most recent by wave.
+        Returns dicts with keys: strategy_id, code, description, model_used, eval_period_sec.
+        """
+        results: list[dict] = []
+        seen: set[str] = set()
+
+        # 1. Hall of Fame (proven winners)
+        async with self.db.execute(
+            """SELECT hof.strategy_id, s.code, s.description, s.model_used, hof.avg_fitness
+               FROM hall_of_fame hof JOIN strategies s ON hof.strategy_id = s.id
+               WHERE hof.status = 'active'
+               ORDER BY hof.avg_fitness DESC LIMIT ?""",
+            (limit,),
+        ) as cur:
+            for row in await cur.fetchall():
+                r = dict(row)
+                if r["strategy_id"] not in seen:
+                    seen.add(r["strategy_id"])
+                    results.append(r)
+
+        if len(results) >= limit:
+            return results[:limit]
+
+        # 2. Most recent strategies from the last wave
+        remaining = limit - len(results)
+        async with self.db.execute(
+            """SELECT s.id AS strategy_id, s.code, s.description, s.model_used
+               FROM strategies s
+               ORDER BY s.created_at DESC LIMIT ?""",
+            (remaining + len(seen),),
+        ) as cur:
+            for row in await cur.fetchall():
+                r = dict(row)
+                if r["strategy_id"] not in seen:
+                    seen.add(r["strategy_id"])
+                    results.append(r)
+                    if len(results) >= limit:
+                        break
+
+        return results[:limit]
 
     # ── Trades ──────────────────────────────────────────────────
 

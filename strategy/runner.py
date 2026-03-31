@@ -18,6 +18,29 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+
+class _SafeEncoder(json.JSONEncoder):
+    """Handles numpy / non-standard types on the host side."""
+    def default(self, obj):
+        try:
+            import numpy as np
+            if isinstance(obj, (np.bool_,)):
+                return bool(obj)
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+        except ImportError:
+            pass
+        return super().default(obj)
+
+
+def _host_dumps(obj: object) -> str:
+    return json.dumps(obj, cls=_SafeEncoder)
+
+
 # The wrapper script that runs inside the Docker container.
 # It loads the strategy, receives ticks via stdin, sends signals via stdout.
 CONTAINER_WORKER = r'''
@@ -25,6 +48,26 @@ import asyncio
 import json
 import sys
 import importlib.util
+
+class _NumpySafeEncoder(json.JSONEncoder):
+    """Handles numpy types that the standard json module rejects."""
+    def default(self, obj):
+        try:
+            import numpy as np
+            if isinstance(obj, (np.bool_,)):
+                return bool(obj)
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+        except ImportError:
+            pass
+        return super().default(obj)
+
+def _dumps(obj):
+    return json.dumps(obj, cls=_NumpySafeEncoder)
 
 class ExchangeProxy:
     """Proxy that communicates with the host via stdout/stdin."""
@@ -36,7 +79,7 @@ class ExchangeProxy:
     async def _request(self, method, **kwargs):
         self._request_id += 1
         req = {"type": "exchange_request", "id": self._request_id, "method": method, "kwargs": kwargs}
-        print(json.dumps(req), flush=True)
+        print(_dumps(req), flush=True)
         # Read response from stdin
         while True:
             line = await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
@@ -89,7 +132,7 @@ async def main():
     strategy = mod.Strategy(exchange)
 
     # Signal ready
-    print(json.dumps({"type": "ready"}), flush=True)
+    print(_dumps({"type": "ready"}), flush=True)
 
     # Main loop: receive ticks, call strategy
     while True:
@@ -102,22 +145,22 @@ async def main():
             try:
                 result = await strategy.on_tick(msg["symbol"], msg["price"], msg["timestamp"])
                 state = strategy.get_state()
-                print(json.dumps({"type": "signal", "result": result, "state": state}), flush=True)
+                print(_dumps({"type": "signal", "result": result, "state": state}), flush=True)
             except Exception as e:
-                print(json.dumps({"type": "error", "error": str(e)}), flush=True)
+                print(_dumps({"type": "error", "error": str(e)}), flush=True)
 
         elif msg["type"] == "candle":
             try:
                 result = await strategy.on_candle(msg["symbol"], msg["candle"], msg["timestamp"])
                 state = strategy.get_state()
-                print(json.dumps({"type": "signal", "result": result, "state": state}), flush=True)
+                print(_dumps({"type": "signal", "result": result, "state": state}), flush=True)
             except Exception as e:
-                print(json.dumps({"type": "error", "error": str(e)}), flush=True)
+                print(_dumps({"type": "error", "error": str(e)}), flush=True)
 
         elif msg["type"] == "shutdown":
             break
 
-    print(json.dumps({"type": "shutdown_ack"}), flush=True)
+    print(_dumps({"type": "shutdown_ack"}), flush=True)
 
 
 asyncio.run(main())
@@ -199,7 +242,7 @@ class StrategyRunner:
         if not sp or sp.process.returncode is not None:
             return None
 
-        tick_msg = json.dumps({"type": "tick", "symbol": symbol, "price": price, "timestamp": timestamp}) + "\n"
+        tick_msg = _host_dumps({"type": "tick", "symbol": symbol, "price": price, "timestamp": timestamp}) + "\n"
         sp.process.stdin.write(tick_msg.encode())
         await sp.process.stdin.drain()
 
@@ -212,7 +255,7 @@ class StrategyRunner:
         if not sp or sp.process.returncode is not None:
             return None
 
-        msg = json.dumps({"type": "candle", "symbol": symbol, "candle": candle, "timestamp": timestamp}) + "\n"
+        msg = _host_dumps({"type": "candle", "symbol": symbol, "candle": candle, "timestamp": timestamp}) + "\n"
         sp.process.stdin.write(msg.encode())
         await sp.process.stdin.drain()
 
@@ -242,7 +285,7 @@ class StrategyRunner:
                     except Exception as e:
                         response = {"type": "exchange_response", "id": msg["id"], "error": str(e)}
 
-                    resp_line = json.dumps(response) + "\n"
+                    resp_line = _host_dumps(response) + "\n"
                     sp.process.stdin.write(resp_line.encode())
                     await sp.process.stdin.drain()
                     continue
@@ -266,7 +309,7 @@ class StrategyRunner:
 
         try:
             if sp.process.returncode is None:
-                shutdown_msg = json.dumps({"type": "shutdown"}) + "\n"
+                shutdown_msg = _host_dumps({"type": "shutdown"}) + "\n"
                 sp.process.stdin.write(shutdown_msg.encode())
                 await sp.process.stdin.drain()
                 await asyncio.wait_for(sp.process.wait(), timeout=5)
