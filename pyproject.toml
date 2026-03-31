@@ -28,6 +28,7 @@ override-dependencies = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+addopts = "-m 'not integration'"
 markers = [
-    "integration: hits the real Binance API (may be slow / need network)",
+    "integration: hits real APIs (Binance, LLM) — costs money, needs network. Run with: pytest -m integration",
 ]

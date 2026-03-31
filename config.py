@@ -58,6 +58,7 @@ class Config:
     max_parallel_strategies: int = field(default_factory=lambda: _int("MAX_PARALLEL_STRATEGIES", "5"))
     tick_interval_sec: int = field(default_factory=lambda: _int("TICK_INTERVAL_SEC", "5"))
     stagnation_wave_threshold: int = field(default_factory=lambda: _int("STAGNATION_WAVE_THRESHOLD", "15"))
+    loop_similarity_threshold: float = field(default_factory=lambda: _float("LOOP_SIMILARITY_THRESHOLD", "0.7"))
 
     # ── Docker / Runner ──────────────────────────────────────────
     docker_memory: str = field(default_factory=lambda: os.getenv("DOCKER_MEMORY", "256m"))

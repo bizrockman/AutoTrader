@@ -111,7 +111,7 @@ class Orchestrator:
             ready_timeout_sec=config.docker_ready_timeout_sec,
             tick_timeout_sec=config.strategy_tick_timeout_sec,
         )
-        self.loop_detector = LoopDetector()
+        self.loop_detector = LoopDetector(similarity_threshold=config.loop_similarity_threshold)
         self.meta = MetaTracker()
         self.connector = BinanceConnector(
             config.binance_api_key, config.binance_secret, timeout_sec=config.api_timeout_sec,
