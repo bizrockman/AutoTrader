@@ -1,0 +1,44 @@
+2026-03-31 18:50:41 [INFO] autotrader: ============================================================
+2026-03-31 18:50:41 [INFO] autotrader:   AutoTrader — Self-Evolving Crypto Trading Bot
+2026-03-31 18:50:41 [INFO] autotrader:   The system is simple. The complexity emerges.
+2026-03-31 18:50:41 [INFO] autotrader: ============================================================
+2026-03-31 18:50:41 [INFO] autotrader: Symbol: BTC/USDT
+2026-03-31 18:50:41 [INFO] autotrader: Default model: claude-opus-4-6
+2026-03-31 18:50:41 [INFO] autotrader: Model pool: ['claude-opus-4-6', 'claude-sonnet-4-6', 'gpt-5.4']
+2026-03-31 18:50:41 [INFO] autotrader: Max parallel strategies: 5
+2026-03-31 18:50:41 [INFO] autotrader: Initial balance: $10,000.00
+2026-03-31 18:50:41 [INFO] evolution.orchestrator: Starting AutoTrader Orchestrator
+2026-03-31 18:50:41 [INFO] evolution.orchestrator: === Evolution Wave (trigger: initial) ===
+2026-03-31 18:50:41 [INFO] evolution.orchestrator: Evolution health: trend=+0.000, best=0.000, stagnating=False
+2026-03-31 18:50:41 [WARNING] evolution.orchestrator: Failed to capture market snapshot: binance GET https://api.binance.com/api/v3/exchangeInfo
+2026-03-31 18:50:41 [INFO] evolution.generator: Generating 5 strategies with claude-opus-4-6
+2026-03-31 18:50:41 [INFO] LiteLLM: 
+LiteLLM completion() model= claude-opus-4-6; provider = anthropic
+2026-03-31 18:50:41 [INFO] evolution.orchestrator: Stopping all strategies...
+2026-03-31 18:50:42 [INFO] evolution.orchestrator: Orchestrator stopped.
+2026-03-31 18:52:21 [INFO] autotrader: ============================================================
+2026-03-31 18:52:21 [INFO] autotrader:   AutoTrader — Self-Evolving Crypto Trading Bot
+2026-03-31 18:52:21 [INFO] autotrader:   The system is simple. The complexity emerges.
+2026-03-31 18:52:21 [INFO] autotrader: ============================================================
+2026-03-31 18:52:21 [INFO] autotrader: Symbol: BTC/USDT
+2026-03-31 18:52:21 [INFO] autotrader: Default model: claude-opus-4-6
+2026-03-31 18:52:21 [INFO] autotrader: Model pool: ['claude-opus-4-6', 'claude-sonnet-4-6', 'gpt-5.4']
+2026-03-31 18:52:21 [INFO] autotrader: Max parallel strategies: 5
+2026-03-31 18:52:21 [INFO] autotrader: Initial balance: $10,000.00
+2026-03-31 18:52:21 [INFO] evolution.orchestrator: Starting AutoTrader Orchestrator
+2026-03-31 18:52:21 [INFO] evolution.orchestrator: === Evolution Wave (trigger: initial) ===
+2026-03-31 18:52:21 [INFO] evolution.orchestrator: Evolution health: trend=+0.000, best=0.000, stagnating=False
+2026-03-31 18:52:24 [INFO] evolution.generator: Generating 5 strategies with claude-opus-4-6
+2026-03-31 18:52:24 [INFO] LiteLLM: 
+LiteLLM completion() model= claude-opus-4-6; provider = anthropic
+2026-03-31 18:53:37 [INFO] evolution.generator: Generated 5 strategies
+2026-03-31 18:53:41 [INFO] strategy.runner: Strategy wave002_bfa388a0 started in container strat_wave002_bfa388a0
+2026-03-31 18:53:41 [INFO] evolution.orchestrator: Deployed wave002_bfa388a0 — eval: 60min — model: claude-opus-4-6 — Mean-reversion strategy using Bollinger Bands. Buys when price touches lower ban
+2026-03-31 18:53:45 [INFO] strategy.runner: Strategy wave002_b7983978 started in container strat_wave002_b7983978
+2026-03-31 18:53:45 [INFO] evolution.orchestrator: Deployed wave002_b7983978 — eval: 60min — model: claude-opus-4-6 — Momentum strategy using RSI and volume confirmation. Buys on RSI oversold (<30) 
+2026-03-31 18:53:49 [INFO] strategy.runner: Strategy wave002_a1b7317d started in container strat_wave002_a1b7317d
+2026-03-31 18:53:49 [INFO] evolution.orchestrator: Deployed wave002_a1b7317d — eval: 60min — model: claude-opus-4-6 — Order book imbalance strategy. Monitors bid/ask depth to detect buying/selling p
+2026-03-31 18:53:53 [INFO] strategy.runner: Strategy wave002_9730c4c7 started in container strat_wave002_9730c4c7
+2026-03-31 18:53:53 [INFO] evolution.orchestrator: Deployed wave002_9730c4c7 — eval: 60min — model: claude-opus-4-6 — EMA crossover with funding rate filter. Uses 9/21 EMA crossover for trend direct
+2026-03-31 18:53:58 [INFO] strategy.runner: Strategy wave002_0884cdbb started in container strat_wave002_0884cdbb
+2026-03-31 18:53:58 [INFO] evolution.orchestrator: Deployed wave002_0884cdbb — eval: 60min — model: claude-opus-4-6 — Trade flow analysis strategy. Monitors recent trades to detect aggressive buying

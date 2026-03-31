@@ -1,0 +1,13 @@
+[project]
+name = "autotrader"
+version = "0.1.0"
+description = "Self-evolving crypto trading bot — LLM-generated strategies with forward-testing"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "litellm>=1.0",
+    "ccxt>=4.0",
+    "aiosqlite>=0.20",
+    "python-dotenv>=1.0",
+    "docker>=7.0",
+]
